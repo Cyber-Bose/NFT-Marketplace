@@ -1,255 +1,121 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.28;
+pragma solidity ^0.8.0;
 
-// Internal imports for NFT OpenZeppelin
-import "@openzeppelin/contracts/utils/Counters.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
-import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 
-import "hardhat/console.sol";
-
-contract NFTMarketplace is ERC721URIStorage {
-    using Counters for Counters.Counter;
-
-    Counters.Counter private _tokenIDs;
-    Counters.Counter private _itemsSold;
-
-    uint256 listingPrice = 0.0025 ether;
-    address payable owner;
-
-    mapping(uint256 => MarketItem) private idMarketItem;
-
-    struct MarketItem {
-        uint256 tokenId;
-        address payable seller;
-        address payable owner;
+contract SimplifiedMarketplace is ERC721URIStorage, Ownable {
+    struct NFTDetails {
         uint256 price;
-        bool sold;
+        address creator; // Original creator for royalties
+        bool isListed;   // Whether the NFT is currently listed for sale
     }
 
-    event idMarketItemCreated(
-        uint256 indexed tokenId,
-        address seller,
-        address owner,
-        uint256 price,
-        bool sold
-    );
+    mapping(uint256 => NFTDetails) public nftDetails;
 
-    modifier onlyOwner() {
-        require(
-            msg.sender == owner,
-            "Only the owner can change the listing price"
-        );
+    uint256 public listingFee = 0.0018 ether;
+    uint256 public royaltyPercentage = 5;
+    uint256 private _tokenIdCounter;
+
+    event NFTMinted(uint256 tokenId, address creator, string cid);
+    event NFTListed(uint256 tokenId, uint256 price, address creator);
+    event NFTBought(uint256 tokenId, address buyer, uint256 price, address seller);
+    event NFTResold(uint256 tokenId, uint256 price, address seller);
+
+    // Constructor: Pass the owner address explicitly to Ownable
+    constructor(string memory name, string memory symbol, address initialOwner)
+        ERC721(name, symbol)
+        Ownable(initialOwner)
+    {}
+
+    modifier onlyOwnerOf(uint256 tokenId) {
+        require(ownerOf(tokenId) == msg.sender, "Caller is not the owner");
         _;
     }
 
-    // a constructor is a special function that is automatically executed when a smart contract is deployed to the blockchain. It is used to initialize the contract's state variables and set up initial conditions. Each contract can have only one constructor, and it is executed only once during the contract's deployment.
+    function mintAndStoreCID(string memory cid) external {
+        uint256 tokenId = _tokenIdCounter++;
+        _mint(msg.sender, tokenId);
 
-    constructor() ERC721("NFT Metaverse Token", "MYNFT") {
-        owner = payable(msg.sender);
+        // Set the tokenURI using the provided CID
+        string memory tokenURI = string(abi.encodePacked("ipfs://", cid));
+        _setTokenURI(tokenId, tokenURI);
+
+        nftDetails[tokenId] = NFTDetails({
+            price: 0,
+            creator: msg.sender,
+            isListed: false
+        });
+
+        emit NFTMinted(tokenId, msg.sender, cid);
     }
 
-    function updateListingPrice(
-        uint256 _listingPrice
-    ) public payable onlyOwner {
-        listingPrice = _listingPrice;
+    function listNFT(uint256 tokenId, uint256 price) external payable onlyOwnerOf(tokenId) {
+        require(msg.value >= listingFee, "Insufficient listing fee");
+        require(price > 0, "Price must be greater than 0");
+
+        nftDetails[tokenId].price = price;
+        nftDetails[tokenId].isListed = true;
+
+        // Send listing fee to contract owner
+        payable(owner()).transfer(msg.value);
+
+        emit NFTListed(tokenId, price, nftDetails[tokenId].creator);
     }
 
-    function getListingPrice() public view returns (uint256) {
-        return listingPrice;
+    function buyNFT(uint256 tokenId) external payable {
+        NFTDetails memory nft = nftDetails[tokenId];
+        require(nft.isListed, "NFT is not listed for sale");
+        require(msg.value >= nft.price, "Insufficient payment");
+
+        address seller = ownerOf(tokenId);
+        uint256 royalty = (msg.value * royaltyPercentage) / 100;
+        uint256 sellerAmount = msg.value - royalty;
+
+        // Transfer Ether to seller and royalties to creator
+        payable(seller).transfer(sellerAmount);
+        payable(nft.creator).transfer(royalty);
+
+        // Transfer ownership of the NFT
+        _transfer(seller, msg.sender, tokenId);
+        nftDetails[tokenId].isListed = false;
+
+        emit NFTBought(tokenId, msg.sender, nft.price, seller);
     }
 
-    // Create NFT Token
+    function resellNFT(uint256 tokenId, uint256 price) external payable onlyOwnerOf(tokenId) {
+        require(msg.value >= listingFee, "Insufficient listing fee");
+        require(price > 0, "Price must be greater than 0");
 
-    function createToken(
-        string memory tokenURI, //Takes an argument tokenURI of type string, which stores the metadata URI for the token. This could be a link to a JSON file describing the token's details.
-        uint256 price
-    ) public payable returns (uint256) {
-        //Indicates that this function can accept Ether. The payable modifier is used here because the function requires the sender to pay a listing fee.
+        nftDetails[tokenId].price = price;
+        nftDetails[tokenId].isListed = true;
 
-        // this function returns the ID of the token Created.
+        // Send listing fee to contract owner
+        payable(owner()).transfer(msg.value);
 
-        require(msg.value == listingPrice, "Listing price must be paid");
-        require(price > 0, "Price must be greater than zero");
-
-        _tokenIDs.increment();
-        uint256 newTokenId = _tokenIDs.current();
-
-        _mint(msg.sender, newTokenId);
-        _setTokenURI(newTokenId, tokenURI);
-
-        createMarketItem(newTokenId, price);
-        return newTokenId;
+        emit NFTResold(tokenId, price, msg.sender);
     }
 
-    /*The functions _mint and _setTokenURI are part of the standard implementation of an ERC-721 token, which is a widely used standard for creating non-fungible tokens (NFTs) on the Ethereum blockchain. These functions are usually inherited from OpenZeppelin's ERC-721 contract, a popular library for secure and reusable smart contract code. */
+    // Receive Ether function to allow the contract to accept Ether
+    receive() external payable {}
 
-    //Summary of the createToken Function:
-    //The function requires the caller to send the exact listingPrice in Ether and to specify a non-zero price for the token.
-    //It increments the token ID counter and mints a new NFT to the caller's address.
-    //It sets the token's URI metadata and creates a corresponding market item for the token, making it available for sale.
-    //Finally, it returns the token's ID.
+    // Fallback function to accept Ether sent with data
+    fallback() external payable {}
 
-    // Create a Market Item
-    function createMarketItem(uint256 tokenId, uint256 price) private {
-        idMarketItem[tokenId] = MarketItem(
-            tokenId,
-            payable(
-                msg.sender
-            ) /*The seller's address, marked as payable to enable receiving payments. msg.sender refers to the account that called the function (the owner of the token)*/,
-            payable(
-                address(this)
-            ) /*The marketplace contract's address. The token will be transferred to the marketplace to facilitate the sale*/,
-            price,
-            false
-        );
-
-        _transfer(
-            msg.sender,
-            address(this),
-            tokenId
-        ); /*_transfer: This function transfers the token from the original owner (msg.sender) to the marketplace contract (address(this)). The _transfer function is typically part of the ERC-721 standard, inherited from the OpenZeppelin ERC-721 implementation*/
-
-        emit idMarketItemCreated(
-            tokenId,
-            msg.sender,
-            address(this),
-            price,
-            false
-        );
-    }
-
-    /*Summary of the createMarketItem Function:
-Creates a Market Listing: The function sets up a new market item by adding an entry in the idMarketItem mapping, specifying the token ID, seller, current owner (the marketplace contract), price, and sale status.
-
-Transfers the Token to the Marketplace Contract: The _transfer function transfers the token from the original owner to the marketplace contract, making it available for sale.
-
-Emits an Event: The idMarketItemCreated event is emitted to log the creation of the market item, providing a way to track this action on the blockchain.*/
-
-    // Function for Resale
-    function reSellToken(uint256 tokenId, uint256 price) public payable {
-        require(
-            idMarketItem[tokenId].owner == msg.sender,
-            "Only item owner can carry out this operation"
-        );
-        require(
-            msg.value == listingPrice,
-            "Price must be equal to the listing price"
-        );
-
-        idMarketItem[tokenId].sold = false;
-        idMarketItem[tokenId].price = price;
-        idMarketItem[tokenId].seller = payable(msg.sender);
-        idMarketItem[tokenId].owner = payable(address(this));
-
-        _itemsSold
-            .decrement(); /*Reduces the count of sold items by one since the token is being relisted and is no longer considered "sold."*/
-
-        _transfer(
-            msg.sender,
-            address(this),
-            tokenId
-        ); /* Transfers the token from the current owner (msg.sender) back to the marketplace contract (address(this)). This is necessary to make the token available for resale.*/
-    }
-
-    /*Summary of the reSellToken Function:
-Verifies Ownership: Ensures that only the current owner of the token can relist it for sale.
-
-Checks the Listing Fee: Confirms that the caller has paid the required listing fee.
-
-Updates Marketplace Records: Sets the token's status to "not sold," updates the price, changes the seller's information, and assigns the 
-marketplace contract as the new owner.
-
-Decrements the Sold Count: Adjusts the count of items marked as sold since the token is now available for resale.
-
-Transfers Ownership to the Marketplace Contract: Moves the token from the owner back to the marketplace, making it available for purchase.*/
-
-    // Function to create a market sale
-    function createMarketSale(uint256 tokenId) public payable {
-        uint256 price = idMarketItem[tokenId].price;
-        address seller = idMarketItem[tokenId].seller;
-
-        require(
-            msg.value == price,
-            "Please submit the asking price in order to complete the purchase"
-        );
-
-        idMarketItem[tokenId].owner = payable(msg.sender);
-        idMarketItem[tokenId].sold = true;
-        idMarketItem[tokenId].seller = payable(address(0));
-
-        _itemsSold.increment();
-        _transfer(address(this), msg.sender, tokenId);
-
-        payable(owner).transfer(listingPrice);
-
-        // Transfer the funds to the seller
-        payable(seller).transfer(msg.value);
-    }
-
-    // Getting unsold NFT data
-    function fetchMarketItem() public view returns (MarketItem[] memory) {
-        uint256 itemCount = _tokenIDs.current();
-        uint256 unSoldItemCount = _tokenIDs.current() - _itemsSold.current();
-        uint256 currentIndex = 0;
-        MarketItem[] memory items = new MarketItem[](unSoldItemCount);
-        for (uint256 i = 0; i < itemCount; i++) {
-            if (idMarketItem[i + 1].owner == address(this)) {
-                //idMarketItem[i + 1].owner == address(this) This will check if the current item at this index is available for sale?
-                uint256 currentId = i + 1;
-                MarketItem storage currentItem = idMarketItem[currentId];
-                items[currentIndex] = currentItem;
-                currentIndex += 1;
-            }
+    function toString(uint256 value) internal pure returns (string memory) {
+        if (value == 0) return "0";
+        uint256 temp = value;
+        uint256 digits;
+        while (temp != 0) {
+            digits++;
+            temp /= 10;
         }
-        return items;
-    }
-
-    // Fetch NFTs owned by the user
-    function fetchMyNFT() public view returns (MarketItem[] memory) {
-        uint256 totalCount = _tokenIDs.current();
-        uint256 itemCount = 0;
-        uint256 currentIndex = 0;
-
-        for (uint256 i = 0; i < totalCount; i++) {
-            if (idMarketItem[i + 1].owner == msg.sender) {
-                itemCount += 1;
-            }
+        bytes memory buffer = new bytes(digits);
+        while (value != 0) {
+            digits -= 1;
+            buffer[digits] = bytes1(uint8(48 + uint256(value % 10)));
+            value /= 10;
         }
-
-        MarketItem[] memory items = new MarketItem[](itemCount);
-        for (uint256 i = 0; i < totalCount; i++) {
-            if (idMarketItem[i + 1].owner == msg.sender) {
-                uint256 currentId = i + 1;
-                MarketItem storage currentItem = idMarketItem[currentId];
-                items[currentIndex] = currentItem;
-                currentIndex += 1;
-            }
-        }
-        return items;
-    }
-
-    // Fetch listed items by the user
-    function fetchItemsListed() public view returns (MarketItem[] memory) {
-        uint256 totalCount = _tokenIDs.current();
-        uint256 itemCount = 0;
-        uint256 currentIndex = 0;
-
-        for (uint256 i = 0; i < totalCount; i++) {
-            if (idMarketItem[i + 1].seller == msg.sender) {
-                itemCount += 1;
-            }
-        }
-
-        MarketItem[] memory items = new MarketItem[](itemCount);
-        for (uint256 i = 0; i < totalCount; i++) {
-            if (idMarketItem[i + 1].seller == msg.sender) {
-                uint256 currentId = i + 1;
-                MarketItem storage currentItem = idMarketItem[currentId];
-                items[currentIndex] = currentItem;
-                currentIndex += 1;
-            }
-        }
-        return items;
+        return string(buffer);
     }
 }
